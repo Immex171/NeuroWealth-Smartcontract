@@ -1,8 +1,11 @@
-//! Tests for rebalance cooldown (Issue #59)
+//! Tests for rebalance cooldown (Issues #59, #250)
 //!
 //! Acceptance criteria:
 //!   1. Configurable minimum ledgers between rebalances (owner-set).
 //!   2. Agent call within cooldown panics with clear error (Error(Contract, #43)).
+//!   3. Boundary timing is fully covered (exact interval, one short, zero).
+//!   4. Concurrent/repeated failed attempts don't advance LastRebalanceLedger.
+//!   5. Pause/unpause interaction leaves cooldown state intact.
 
 use super::utils::*;
 use soroban_sdk::{symbol_short, testutils::Ledger, Env};
@@ -347,4 +350,214 @@ fn test_rebalance_blocked_one_ledger_before_boundary() {
 
     // elapsed == interval - 1 < interval → must panic
     client.rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+}
+
+// ============================================================================
+// AC-3: Boundary timing — additional edge cases (#250)
+// ============================================================================
+
+/// Multiple repeated failed attempts within cooldown must ALL be rejected and
+/// must NEVER advance LastRebalanceLedger beyond the first successful call.
+#[test]
+fn test_multiple_repeated_failures_preserve_last_rebalance_ledger() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, _agent, _owner) = setup_vault(&env);
+    let client = NeuroWealthVaultClient::new(&env, &contract_id);
+
+    client.set_rebalance_cooldown(&50_u32);
+
+    // First rebalance succeeds; record the ledger it stamps
+    client.rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+    let ledger_after_first = client.get_last_rebalance_ledger();
+
+    // Three repeated failed attempts — none should change LastRebalanceLedger
+    for _ in 0..3 {
+        let _ = client.try_rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+        assert_eq!(
+            client.get_last_rebalance_ledger(),
+            ledger_after_first,
+            "LastRebalanceLedger must not change on cooldown rejection"
+        );
+    }
+}
+
+/// Advancing the ledger exactly to the interval boundary (elapsed == interval)
+/// then failing on the next rebalance (one past boundary — new cooldown starts)
+/// demonstrates the sliding window behaviour.
+#[test]
+fn test_sliding_cooldown_window_after_successful_second_call() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, _agent, _owner) = setup_vault(&env);
+    let client = NeuroWealthVaultClient::new(&env, &contract_id);
+
+    let interval = 10_u32;
+    client.set_rebalance_cooldown(&interval);
+
+    // First rebalance
+    client.rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+    let first_ledger = client.get_last_rebalance_ledger();
+
+    // Advance to exactly the boundary for the second call
+    env.ledger().with_mut(|li| {
+        li.sequence_number = first_ledger + interval;
+    });
+
+    // Second rebalance succeeds; stamps a new LastRebalanceLedger
+    client.rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+    let second_ledger = client.get_last_rebalance_ledger();
+    assert!(
+        second_ledger >= first_ledger + interval,
+        "second LastRebalanceLedger must advance to the new window"
+    );
+
+    // Immediately after the second call the cooldown resets — third call blocked
+    let result = client.try_rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+    assert!(
+        result.is_err(),
+        "third call immediately after second should be blocked by new cooldown window"
+    );
+}
+
+// ============================================================================
+// AC-4: Concurrent / repeated attempts (#250)
+// ============================================================================
+
+/// Enabling a large cooldown (u32::MAX ledgers) permanently blocks rebalances
+/// until the owner disables it. This tests an extreme configuration.
+#[test]
+fn test_very_large_cooldown_blocks_rebalance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, _agent, _owner) = setup_vault(&env);
+    let client = NeuroWealthVaultClient::new(&env, &contract_id);
+
+    // Use a very large but not max value to avoid ledger arithmetic overflow
+    let huge_interval: u32 = 1_000_000;
+    client.set_rebalance_cooldown(&huge_interval);
+
+    // First call records LastRebalanceLedger
+    client.rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+
+    // Advance ledger by a lot — but still less than huge_interval
+    env.ledger().with_mut(|li| {
+        li.sequence_number += 500_000;
+    });
+
+    // Still blocked
+    let result = client.try_rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+    assert!(
+        result.is_err(),
+        "rebalance must be blocked when elapsed < huge_interval"
+    );
+}
+
+/// Owner can update the cooldown while the previous window is still active.
+/// The NEW interval is applied to the NEXT call, not retroactively.
+#[test]
+fn test_changing_cooldown_mid_window_applies_to_next_call() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, _agent, _owner) = setup_vault(&env);
+    let client = NeuroWealthVaultClient::new(&env, &contract_id);
+
+    client.set_rebalance_cooldown(&100_u32);
+
+    client.rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+    let last = client.get_last_rebalance_ledger();
+
+    // Lower the cooldown to 5 while we're still inside the original 100-ledger window
+    client.set_rebalance_cooldown(&5_u32);
+    assert_eq!(client.get_rebalance_cooldown(), 5);
+
+    // Advance past the new (shorter) interval
+    env.ledger().with_mut(|li| {
+        li.sequence_number = last + 5;
+    });
+
+    // Should now succeed because elapsed (5) >= new_interval (5)
+    client.rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+}
+
+// ============================================================================
+// AC-5: Pause / unpause interaction (#250)
+// ============================================================================
+
+/// Pausing the vault does not reset or invalidate the rebalance cooldown.
+/// After unpausing, the same cooldown window continues from LastRebalanceLedger.
+#[test]
+fn test_cooldown_survives_pause_unpause_cycle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, _agent, owner) = setup_vault(&env);
+    let client = NeuroWealthVaultClient::new(&env, &contract_id);
+
+    let interval = 20_u32;
+    client.set_rebalance_cooldown(&interval);
+
+    // First rebalance stamps LastRebalanceLedger
+    client.rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+    let last_before_pause = client.get_last_rebalance_ledger();
+
+    // Pause the vault
+    client.pause(&owner);
+
+    // LastRebalanceLedger and cooldown config must be unchanged during pause
+    assert_eq!(
+        client.get_last_rebalance_ledger(),
+        last_before_pause,
+        "pause must not alter LastRebalanceLedger"
+    );
+    assert_eq!(
+        client.get_rebalance_cooldown(),
+        interval,
+        "pause must not alter cooldown interval"
+    );
+
+    // Unpause; the cooldown window from the first rebalance is still in effect
+    client.unpause(&owner);
+
+    // Still within the original cooldown window — must be blocked
+    let result = client.try_rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+    assert!(
+        result.is_err(),
+        "rebalance must still be blocked after unpause when cooldown has not elapsed"
+    );
+}
+
+/// After pause + unpause the rebalance succeeds once the cooldown finally elapses.
+#[test]
+fn test_rebalance_allowed_after_unpause_and_cooldown_elapsed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, _agent, owner) = setup_vault(&env);
+    let client = NeuroWealthVaultClient::new(&env, &contract_id);
+
+    let interval = 15_u32;
+    client.set_rebalance_cooldown(&interval);
+
+    client.rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+    let last = client.get_last_rebalance_ledger();
+
+    client.pause(&owner);
+    client.unpause(&owner);
+
+    // Advance past the cooldown
+    env.ledger().with_mut(|li| {
+        li.sequence_number = last + interval;
+    });
+
+    // Must succeed now that cooldown has elapsed after unpause
+    client.rebalance(&symbol_short!("none"), &0_i128, &0_i128);
+    assert!(
+        client.get_last_rebalance_ledger() >= last + interval,
+        "LastRebalanceLedger should advance after cooldown-elapsed rebalance post-unpause"
+    );
 }

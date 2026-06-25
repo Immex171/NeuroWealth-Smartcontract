@@ -48,8 +48,19 @@ jobs:
       - name: ✅ Validate contract specification
         run: |
           echo "Validating specification against contract implementation..."
+          echo "Local equivalent: python3 scripts/validate-spec.py"
           python3 scripts/validate-spec.py
-      
+
+      - name: 🔬 Detect parameter and error-shape drift
+        run: |
+          echo "Checking event field names and VaultError codes for drift..."
+          echo "This step fails if any event struct field or error code number"
+          echo "diverges from what is documented in contract-spec.json."
+          echo ""
+          echo "Local equivalent: python3 scripts/validate-spec.py"
+          python3 scripts/validate-spec.py
+          echo "✅ No parameter or error-shape drift detected"
+
       - name: 📊 Check spec completeness
         run: |
           echo "Checking specification completeness..."

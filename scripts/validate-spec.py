@@ -2,217 +2,356 @@
 """
 Validate that the contract specification matches the actual implementation.
 
-This script:
-1. Parses the contract source code to extract actual function signatures
-2. Compares against the spec to ensure completeness and accuracy
-3. Reports discrepancies and missing functions/events
+Checks performed:
+  1. Every public function in the contract is documented in the spec.
+  2. Every event struct defined in the contract is in the spec.
+  3. Event field names in the spec match the struct fields in source.
+  4. VaultError numeric codes in the spec match the enum assignments in source.
+  5. Spec has the required top-level fields.
 
-Usage:
+Usage (local):
     python3 scripts/validate-spec.py
-    
+
 Exit codes:
-    0: Spec is valid and complete
-    1: Spec validation failed (missing or incorrect items)
+    0: Spec is valid and current
+    1: Drift detected — spec must be updated
 """
 
 import json
 import re
 from pathlib import Path
-from typing import Set, Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 import sys
 
 
 class ContractValidator:
     """Validate contract spec against actual implementation."""
-    
+
     def __init__(self, contract_path: str, spec_path: str):
         self.contract_path = Path(contract_path)
         self.spec_path = Path(spec_path)
-        
+
         if not self.contract_path.exists():
             raise FileNotFoundError(f"Contract file not found: {contract_path}")
         if not self.spec_path.exists():
             raise FileNotFoundError(f"Spec file not found: {spec_path}")
-        
+
         self.source = self.contract_path.read_text()
         with open(self.spec_path) as f:
             self.spec = json.load(f)
-        
-        self.errors = []
-        self.warnings = []
-        self.info = []
-    
+
+        self.errors: List[str] = []
+        self.warnings: List[str] = []
+        self.info: List[str] = []
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
     def validate(self) -> bool:
-        """Run all validation checks."""
+        """Run all validation checks. Returns True when no errors."""
         print("=" * 70)
-        print("NeuroWealth Vault - Contract Specification Validator")
+        print("NeuroWealth Vault — Contract Specification Validator")
         print("=" * 70)
-        
+
         self._validate_functions()
         self._validate_events()
+        self._validate_event_fields()
+        self._validate_error_codes()
         self._validate_spec_structure()
-        
+
         return self._report_results()
-    
+
+    # ------------------------------------------------------------------
+    # Function validation
+    # ------------------------------------------------------------------
+
     def _validate_functions(self):
-        """Check that all functions in spec exist in contract."""
         print("\n📋 Validating Functions...")
-        
-        # Extract function names from contract
-        contract_functions = self._extract_contract_functions()
-        spec_functions = {f["name"] for f in self.spec.get("functions", [])}
-        
-        print(f"   Contract has {len(contract_functions)} functions")
-        print(f"   Spec documents {len(spec_functions)} functions")
-        
-        # Check for missing functions in spec
-        missing_in_spec = contract_functions - spec_functions
-        if missing_in_spec:
-            for func in sorted(missing_in_spec):
-                self.errors.append(f"Function '{func}' in contract but not in spec")
-        
-        # Check for extra functions in spec
-        extra_in_spec = spec_functions - contract_functions
-        if extra_in_spec:
-            for func in sorted(extra_in_spec):
-                self.warnings.append(f"Function '{func}' in spec but not in contract (may be deprecated)")
-        
-        # Validate function parameters
-        self._validate_function_parameters(contract_functions)
-        
-        if not missing_in_spec and not extra_in_spec:
+        contract_fns = self._extract_contract_functions()
+        spec_fns = {f["name"] for f in self.spec.get("functions", [])}
+
+        print(f"   Contract has {len(contract_fns)} public functions")
+        print(f"   Spec documents {len(spec_fns)} functions")
+
+        missing = contract_fns - spec_fns
+        for fn in sorted(missing):
+            self.errors.append(f"Function '{fn}' exists in contract but is absent from spec")
+
+        extra = spec_fns - contract_fns
+        for fn in sorted(extra):
+            self.warnings.append(
+                f"Function '{fn}' is in spec but not in contract (deprecated?)"
+            )
+
+        self._validate_function_parameters(contract_fns)
+
+        if not missing and not extra:
             self.info.append("✓ All contract functions are documented in spec")
-    
+
     def _extract_contract_functions(self) -> Set[str]:
-        """Extract all public function names from contract."""
-        # Match "pub fn name(" or "pub async fn name("
-        pattern = r'pub\s+(?:async\s+)?fn\s+(\w+)\s*\('
-        matches = re.findall(pattern, self.source)
-        return set(matches)
-    
-    def _validate_function_parameters(self, contract_functions: Set[str]):
-        """Validate that function parameters match spec."""
-        for func_name in contract_functions:
-            # Find function in contract
-            pattern = rf'pub\s+(?:async\s+)?fn\s+{func_name}\s*\(([^)]*)\)'
+        pattern = r"pub\s+(?:async\s+)?fn\s+(\w+)\s*\("
+        return set(re.findall(pattern, self.source))
+
+    def _validate_function_parameters(self, contract_fns: Set[str]):
+        for fn_name in contract_fns:
+            pattern = rf"pub\s+(?:async\s+)?fn\s+{fn_name}\s*\(([^)]*)\)"
             match = re.search(pattern, self.source)
             if not match:
                 continue
-            
             params = match.group(1)
-            
-            # Find function in spec
-            spec_func = next((f for f in self.spec.get("functions", []) 
-                             if f["name"] == func_name), None)
-            if not spec_func:
+            spec_fn = next(
+                (f for f in self.spec.get("functions", []) if f["name"] == fn_name),
+                None,
+            )
+            if not spec_fn:
                 continue
-            
-            # Check if 'env' parameter is documented
-            if "env" in params and not any(p.get("name") == "env" 
-                                          for p in spec_func.get("parameters", [])):
-                self.warnings.append(f"Function '{func_name}': 'env' parameter not documented in spec")
-    
+            if "env" in params and not any(
+                p.get("name") == "env" for p in spec_fn.get("parameters", [])
+            ):
+                self.warnings.append(
+                    f"Function '{fn_name}': 'env' parameter not documented in spec"
+                )
+
+    # ------------------------------------------------------------------
+    # Event type-name validation
+    # ------------------------------------------------------------------
+
     def _validate_events(self):
-        """Check that all events are documented."""
-        print("\n📢 Validating Events...")
-        
-        # Extract event types from contract
-        event_pattern = r'pub struct (\w*Event)\s*\{'
-        contract_events = set(re.findall(event_pattern, self.source))
+        print("\n📢 Validating Event Types...")
+        pattern = r"pub struct (\w*Event)\s*\{"
+        contract_events = set(re.findall(pattern, self.source))
         spec_events = {e["name"] for e in self.spec.get("events", [])}
-        
-        print(f"   Contract defines {len(contract_events)} events")
-        print(f"   Spec documents {len(spec_events)} events")
-        
-        # Check for missing events
-        missing_events = contract_events - spec_events
-        if missing_events:
-            for event in sorted(missing_events):
-                self.warnings.append(f"Event '{event}' defined in contract but not documented in spec")
-        
-        # Check for extra events
-        extra_events = spec_events - contract_events
-        if extra_events:
-            for event in sorted(extra_events):
-                self.warnings.append(f"Event '{event}' in spec but not found in contract")
-        
-        if not missing_events and not extra_events:
+
+        print(f"   Contract defines {len(contract_events)} event structs")
+        print(f"   Spec documents {len(spec_events)} event types")
+
+        for ev in sorted(contract_events - spec_events):
+            self.warnings.append(f"Event '{ev}' defined in contract but absent from spec")
+
+        for ev in sorted(spec_events - contract_events):
+            self.warnings.append(f"Event '{ev}' in spec but not found in contract")
+
+        if contract_events == spec_events:
             self.info.append("✓ All contract events are documented in spec")
-    
+
+    # ------------------------------------------------------------------
+    # Event field validation (new in #251)
+    # ------------------------------------------------------------------
+
+    def _validate_event_fields(self):
+        """
+        For every event documented in the spec, verify that its listed field
+        names match the public fields of the corresponding Rust struct.
+
+        This catches renames, additions, and removals of struct fields that
+        would cause event payloads to silently drift from the spec.
+        """
+        print("\n🔎 Validating Event Field Names...")
+        drift_found = False
+
+        for spec_event in self.spec.get("events", []):
+            event_name = spec_event.get("name", "")
+            if not event_name:
+                continue
+
+            # Extract the struct body from source: pub struct FooEvent { … }
+            struct_pattern = (
+                rf"pub\s+struct\s+{re.escape(event_name)}\s*\{{([^}}]*)\}}"
+            )
+            match = re.search(struct_pattern, self.source, re.DOTALL)
+            if not match:
+                # Already flagged by _validate_events
+                continue
+
+            struct_body = match.group(1)
+            # Each public field: pub field_name: Type,
+            field_pattern = r"pub\s+(\w+)\s*:"
+            contract_fields = set(re.findall(field_pattern, struct_body))
+
+            spec_fields = {
+                f["name"] for f in spec_event.get("fields", []) if "name" in f
+            }
+
+            missing_in_spec = contract_fields - spec_fields
+            extra_in_spec = spec_fields - contract_fields
+
+            for f in sorted(missing_in_spec):
+                self.errors.append(
+                    f"Event '{event_name}': field '{f}' exists in contract struct "
+                    f"but is absent from spec — update spec to match"
+                )
+                drift_found = True
+
+            for f in sorted(extra_in_spec):
+                self.errors.append(
+                    f"Event '{event_name}': field '{f}' is in spec but not in "
+                    f"contract struct — remove from spec or add to struct"
+                )
+                drift_found = True
+
+        if not drift_found:
+            self.info.append("✓ All event field names match contract structs")
+
+    # ------------------------------------------------------------------
+    # Error code validation (new in #251)
+    # ------------------------------------------------------------------
+
+    def _validate_error_codes(self):
+        """
+        Extract VaultError enum variants and their numeric codes from the
+        contract source, then verify the spec's error entries match.
+
+        Detects: renumbered codes, removed variants, or spec entries that no
+        longer correspond to a real error.
+        """
+        print("\n❗ Validating Error Codes...")
+
+        # Parse: ErrorVariantName = 42,
+        error_pattern = r"(\w+)\s*=\s*(\d+)\s*,"
+        # Limit to the VaultError enum body
+        enum_match = re.search(
+            r"pub\s+enum\s+VaultError\s*\{([^}]*)\}", self.source, re.DOTALL
+        )
+        if not enum_match:
+            self.warnings.append(
+                "Could not locate VaultError enum in source; skipping error code validation"
+            )
+            return
+
+        contract_errors: Dict[int, str] = {}
+        for variant, code_str in re.findall(error_pattern, enum_match.group(1)):
+            contract_errors[int(code_str)] = variant
+
+        print(f"   Contract defines {len(contract_errors)} VaultError variants")
+
+        # Spec errors: keys like "VaultError::NegativeMin" → {"code": 1, ...}
+        spec_vault_errors: Dict[int, str] = {}
+        for key, val in self.spec.get("errors", {}).items():
+            if not key.startswith("VaultError::"):
+                continue
+            variant_name = key[len("VaultError::"):]
+            code = val.get("code") if isinstance(val, dict) else None
+            if code is None:
+                self.warnings.append(
+                    f"Spec error entry '{key}' has no 'code' field"
+                )
+                continue
+            spec_vault_errors[int(code)] = variant_name
+
+        print(f"   Spec documents {len(spec_vault_errors)} VaultError entries")
+
+        drift_found = False
+
+        # Codes in contract but missing from spec
+        for code, variant in sorted(contract_errors.items()):
+            if code not in spec_vault_errors:
+                self.errors.append(
+                    f"VaultError::{variant} (code {code}) exists in contract "
+                    f"but is absent from spec errors"
+                )
+                drift_found = True
+            elif spec_vault_errors[code] != variant:
+                self.errors.append(
+                    f"Error code {code}: contract has '{variant}' but spec has "
+                    f"'{spec_vault_errors[code]}' — name drift detected"
+                )
+                drift_found = True
+
+        # Codes in spec but not in contract
+        for code, variant in sorted(spec_vault_errors.items()):
+            if code not in contract_errors:
+                self.errors.append(
+                    f"Spec error VaultError::{variant} (code {code}) has no "
+                    f"matching variant in the contract enum"
+                )
+                drift_found = True
+
+        if not drift_found:
+            self.info.append("✓ All VaultError codes match between contract and spec")
+
+    # ------------------------------------------------------------------
+    # Spec structure validation
+    # ------------------------------------------------------------------
+
     def _validate_spec_structure(self):
-        """Validate that spec has required structure."""
         print("\n🔍 Validating Spec Structure...")
-        
-        required_fields = ["version", "contract", "network", "functions", "events", "errors"]
-        missing_fields = [f for f in required_fields if f not in self.spec]
-        
-        if missing_fields:
-            for field in missing_fields:
-                self.errors.append(f"Spec missing required field: '{field}'")
+        required = ["version", "contract", "network", "functions", "events", "errors"]
+        missing = [f for f in required if f not in self.spec]
+        if missing:
+            for f in missing:
+                self.errors.append(f"Spec is missing required top-level field: '{f}'")
         else:
             self.info.append("✓ Spec has all required top-level fields")
-        
-        # Validate function structure
-        for func in self.spec.get("functions", []):
-            if "name" not in func:
-                self.errors.append("Function spec missing 'name' field")
-            if "description" not in func:
-                self.warnings.append(f"Function '{func.get('name')}' missing 'description'")
-            if "parameters" not in func:
-                self.warnings.append(f"Function '{func.get('name')}' missing 'parameters'")
-        
-        # Validate event structure
-        for event in self.spec.get("events", []):
-            if "name" not in event:
-                self.errors.append("Event spec missing 'name' field")
-            if "description" not in event:
-                self.warnings.append(f"Event '{event.get('name')}' missing 'description'")
-    
+
+        for fn in self.spec.get("functions", []):
+            if "name" not in fn:
+                self.errors.append("A function spec entry is missing the 'name' field")
+            if "description" not in fn:
+                self.warnings.append(
+                    f"Function '{fn.get('name')}' is missing 'description'"
+                )
+
+        for ev in self.spec.get("events", []):
+            if "name" not in ev:
+                self.errors.append("An event spec entry is missing the 'name' field")
+            if "description" not in ev:
+                self.warnings.append(
+                    f"Event '{ev.get('name')}' is missing 'description'"
+                )
+
+    # ------------------------------------------------------------------
+    # Report
+    # ------------------------------------------------------------------
+
     def _report_results(self) -> bool:
-        """Report validation results."""
         print("\n" + "=" * 70)
         print("Validation Results")
         print("=" * 70)
-        
+
         if self.info:
             print("\n✅ Passed Checks:")
             for msg in self.info:
                 print(f"   {msg}")
-        
+
         if self.warnings:
             print("\n⚠️  Warnings:")
             for msg in self.warnings:
                 print(f"   ⚠️  {msg}")
-        
+
         if self.errors:
-            print("\n❌ Errors:")
+            print("\n❌ Errors (spec must be updated):")
             for msg in self.errors:
                 print(f"   ❌ {msg}")
+            print(
+                "\n💡 To fix: update contract-spec.json so every function, event field,\n"
+                "   and error code matches the contract source, then re-run:\n"
+                "   python3 scripts/validate-spec.py"
+            )
             return False
-        
-        print("\n✅ All validation checks passed!")
+
+        print("\n✅ All validation checks passed — spec is current.")
         return True
 
 
 def main():
-    """Main entry point."""
     contract_path = "neurowealth-vault/contracts/vault/src/lib.rs"
     spec_path = "contract-spec.json"
-    
+
     try:
         validator = ContractValidator(contract_path, spec_path)
         success = validator.validate()
-        exit(0 if success else 1)
-        
+        sys.exit(0 if success else 1)
+
     except FileNotFoundError as e:
-        print(f"❌ Error: {e}", file=sys.stderr)
-        exit(1)
+        print(f"❌ {e}", file=sys.stderr)
+        sys.exit(1)
     except json.JSONDecodeError as e:
         print(f"❌ Invalid JSON in spec: {e}", file=sys.stderr)
-        exit(1)
+        sys.exit(1)
     except Exception as e:
         print(f"❌ Validation failed: {e}", file=sys.stderr)
-        exit(1)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
